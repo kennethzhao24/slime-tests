@@ -1,0 +1,191 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+
+%labels
+    Author yzhao25
+    Description Slime GH200 / Grace Hopper image with CUDA 12.8 userspace for Apptainer
+
+%help
+    This Apptainer definition builds a GH200-oriented Slime environment on top of
+    nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04.
+
+    Example build:
+      apptainer build slime-gh200-cu128.sif docker/slime-gh200-cu128.def
+
+    Example runtime:
+      apptainer exec --nv slime-gh200-cu128.sif /bin/bash --login
+
+%environment
+    export CUDA_HOME=/usr/local/cuda
+    export TORCH_CUDA_ARCH_LIST=9.0
+    export MAX_JOBS=64
+    export VENV=/opt/venv
+    export PATH=${VENV}/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+
+%post -c /bin/bash
+    set -euxo pipefail
+
+    export DEBIAN_FRONTEND=noninteractive
+    export CUDA_HOME=/usr/local/cuda
+    export TORCH_CUDA_ARCH_LIST=9.0
+    export MAX_JOBS=64
+    export VENV=/opt/venv
+    export PATH=${VENV}/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+
+    mkdir -p /sgl-workspace
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ccache \
+        cmake \
+        curl \
+        dnsutils \
+        git \
+        git-lfs \
+        libibverbs-dev \
+        libibverbs1 \
+        libnuma-dev \
+        libnuma1 \
+        libopenmpi-dev \
+        libssl-dev \
+        ninja-build \
+        nvtop \
+        openssh-server \
+        patchelf \
+        pkg-config \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        rsync \
+        software-properties-common \
+        wget && \
+        rm -rf /var/lib/apt/lists/*
+
+    ln -sf /usr/bin/python3 /usr/bin/python
+    python3 -m venv "${VENV}"
+    python -m pip install --upgrade pip setuptools wheel
+
+    PYTORCH_VERSION=2.9.1
+    TORCHAUDIO_VERSION=2.9.1
+    TORCHVISION_VERSION=0.24.1
+    ENABLE_FLASH_ATTN_HOPPER=1
+    FLASH_ATTN_MAX_JOBS=16
+    SGLANG_VERSION=v0.5.9
+    SGL_KERNEL_VERSION=0.3.17.post2
+    SLIME_COMMIT=main
+    PATCH_VERSION=latest
+    MEGATRON_COMMIT=3714d81d418c9f1bca4594fc35f9e8289f652862
+    ENABLE_SGLANG_PATCH=1
+    DOWNLOAD_FLASHINFER_CUBIN=0
+
+    python -m pip install \
+        torch==${PYTORCH_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        --extra-index-url https://download.pytorch.org/whl/cu128
+
+    python -m pip install git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c --no-deps
+    python -m pip install flash-linear-attention==0.4.1
+    python -m pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+
+    git clone https://github.com/sgl-project/sglang.git /sgl-workspace/sglang
+    cd /sgl-workspace/sglang
+    git checkout ${SGLANG_VERSION}
+    python -m pip install sgl-kernel==${SGL_KERNEL_VERSION}
+    python -m pip install -e "python[all]" --extra-index-url https://download.pytorch.org/whl/cu128
+
+    if [ "${DOWNLOAD_FLASHINFER_CUBIN}" = "1" ]; then
+        FLASHINFER_LOGGING_LEVEL=warning python -m flashinfer --download-cubin
+    fi
+
+    git clone https://github.com/NVIDIA/Megatron-LM.git --recursive /root/Megatron-LM
+    cd /root/Megatron-LM
+    git checkout ${MEGATRON_COMMIT}
+    python -m pip install -e .
+
+    python -m pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@dc6876905830430b5054325fa4211ff302169c6b --no-cache-dir --force-reinstall
+    python -m pip install git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl --no-build-isolation
+    python -m pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation
+    python -m pip install nvidia-cudnn-cu12==9.16.0.29
+    python -m pip install "numpy<2"
+
+    # Build CUDA-sensitive extensions only after the final torch/sglang stack is in place.
+    # On GH200/aarch64 we rely on the Hopper-specific source build instead of the
+    # flash-attn wheel path.
+    if [ "${ENABLE_FLASH_ATTN_HOPPER}" = "1" ]; then
+        git clone https://github.com/Dao-AILab/flash-attention.git /root/flash-attention
+        cd /root/flash-attention
+        git checkout fbf24f67cf7f6442c5cfb2c1057f4bfc57e72d89
+        git submodule update --init
+        cd hopper
+        MAX_JOBS=${FLASH_ATTN_MAX_JOBS} python setup.py install
+        python_path="$(python -c "import site; print(site.getsitepackages()[0])")"
+        mkdir -p "${python_path}/flash_attn_3"
+        cp flash_attn_interface.py "${python_path}/flash_attn_3/flash_attn_interface.py"
+        cd /root
+        rm -rf /root/flash-attention
+    else
+        echo "Skipping Hopper flash-attention build for the initial GH200 cu128 image build."
+    fi
+
+    python -m pip install --no-build-isolation "transformer_engine[pytorch]==2.10.0"
+
+    NVCC_APPEND_FLAGS="--threads 4" \
+      python -m pip install -v --disable-pip-version-check --no-cache-dir \
+      --no-build-isolation \
+      --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
+      git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
+
+    git clone https://github.com/THUDM/slime.git /root/slime
+    cd /root/slime
+    git checkout ${SLIME_COMMIT}
+
+    if [ -f /root/slime/requirements.txt ]; then
+        python -m pip install -r /root/slime/requirements.txt
+    fi
+
+    megatron_patch="/root/slime/docker/patch/${PATCH_VERSION}/megatron.patch"
+    if [ -f "${megatron_patch}" ]; then
+        cd /root/Megatron-LM
+        git update-index --refresh
+        git apply "${megatron_patch}" --3way
+        if grep -R -n '^<<<<<<< ' .; then
+            echo "Megatron patch failed to apply cleanly. Please resolve conflicts."
+            exit 1
+        fi
+    else
+        echo "Skipping Megatron patch because ${megatron_patch} was not found."
+    fi
+
+    sglang_patch="/root/slime/docker/patch/${PATCH_VERSION}/sglang.patch"
+    if [ "${ENABLE_SGLANG_PATCH}" = "1" ] && [ -f "${sglang_patch}" ]; then
+        cd /sgl-workspace/sglang
+        git update-index --refresh
+        git apply "${sglang_patch}" --3way
+        if grep -R -n '^<<<<<<< ' .; then
+            echo "SGLang patch failed to apply cleanly. Please resolve conflicts."
+            exit 1
+        fi
+    else
+        echo "Skipping SGLang patch."
+    fi
+
+    cd /root/slime
+    python -m pip install -e . --no-deps
+
+    cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat
+    python -m pip install . --no-build-isolation
+
+    rm -rf /root/.cache/pip
+
+%runscript
+    exec /bin/bash --login "$@"
+
+%test
+    #!/bin/bash
+    set -euxo pipefail
+    source /opt/venv/bin/activate
+    python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
