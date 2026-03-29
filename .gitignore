@@ -1,3 +1,5 @@
 *.state
 **/logs/
 *.sif
+*.out
+**/wandb/

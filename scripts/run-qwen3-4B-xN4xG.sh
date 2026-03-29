@@ -1,16 +1,19 @@
 #!/bin/bash
-# 2-node, 8-GPU (4 per node) Qwen3-4B GRPO training.
+# X-node, 4X-GPU (4 per node) Qwen3-4B GRPO training.
 #
-# Usage:
-#   Head node:
-#     MASTER_ADDR=172.28.82.60 LOCAL_NODE_IP=172.28.82.60 SOCKET_IFNAME=hsn0 ROLE=head bash scripts/run-qwen3-4B-2N8G.sh
+# Set ACTOR_NUM_NODES to the number of GH200 nodes you want to use.
 #
-#   Worker node:
-#     MASTER_ADDR=172.28.82.60 LOCAL_NODE_IP=172.28.82.132 SOCKET_IFNAME=hsn0 ROLE=worker bash scripts/run-qwen3-4B-2N8G.sh
+# Examples:
+#   2 nodes / 8 GPUs:
+#     ACTOR_NUM_NODES=2 MASTER_ADDR=<head_ip> LOCAL_NODE_IP=<head_ip> SOCKET_IFNAME=hsn0 ROLE=head \
+#       bash scripts/run-qwen3-4B-xN4xG.sh
 #
+#   4 nodes / 16 GPUs:
+#     ACTOR_NUM_NODES=4 MASTER_ADDR=<head_ip> LOCAL_NODE_IP=<head_ip> SOCKET_IFNAME=hsn0 ROLE=head \
+#       bash scripts/run-qwen3-4B-xN4xG.sh
 #
-#   If ROLE is unset, the script defaults to head mode. NODE_RANK=1 is also
-#   treated as worker mode for compatibility with older usage.
+# Worker nodes use the same script with ROLE=worker and LOCAL_NODE_IP set to the
+# worker's address. If ROLE is unset, the script defaults to head mode.
 
 export PATH="/opt/venv/bin:${PATH}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/venv/bin/python3}"
@@ -18,7 +21,17 @@ RAY_BIN="${RAY_BIN:-/opt/venv/bin/ray}"
 TRAIN_PY="${TRAIN_PY:-/root/slime/train.py}"
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-4}"
+TOTAL_NUM_GPUS=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-$((8 * ACTOR_NUM_NODES))}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((32 * ACTOR_NUM_NODES))}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-6144}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
+SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.7}"
+WANDB_PROJECT="${WANDB_PROJECT:-slime-tests}"
+WANDB_GROUP="${WANDB_GROUP:-qwen3-4B-${ACTOR_NUM_NODES}n${TOTAL_NUM_GPUS}g}"
 RAY_CLUSTER_WAIT_TIMEOUT_SECS="${RAY_CLUSTER_WAIT_TIMEOUT_SECS:-300}"
 RAY_CLUSTER_WAIT_INTERVAL_SECS="${RAY_CLUSTER_WAIT_INTERVAL_SECS:-5}"
 ROLE="${ROLE:-}"
@@ -74,7 +87,10 @@ source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 
 : "${MASTER_ADDR:?MASTER_ADDR must be set to the head node IP}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-eth0}"
+NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-${SOCKET_IFNAME}}"
 echo "Using SOCKET_IFNAME: ${SOCKET_IFNAME}"
+echo "Using NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}"
+echo "Configured nodes=${ACTOR_NUM_NODES} gpus_per_node=${ACTOR_NUM_GPUS_PER_NODE} total_gpus=${TOTAL_NUM_GPUS}"
 
 LOCAL_NODE_IP="${LOCAL_NODE_IP:-}"
 if [[ -z "${LOCAL_NODE_IP}" ]]; then
@@ -119,18 +135,18 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
-   --num-rollout 50
-   --rollout-batch-size 16
-   --n-samples-per-prompt 4
+   --num-rollout "${NUM_ROLLOUT}"
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --rollout-max-response-len 4096
    --rollout-temperature 1
 
-   --global-batch-size 64
+   --global-batch-size "${GLOBAL_BATCH_SIZE}"
    --balance-data
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
+   --eval-interval "${EVAL_INTERVAL}"
    --eval-prompt-data aime /mnt/datasets/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
@@ -151,7 +167,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 6144
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
 
 GRPO_ARGS=(
@@ -175,15 +191,14 @@ OPTIMIZER_ARGS=(
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project slime-tests
-   --wandb-group qwen3-4B-2n8g
+   --wandb-project "${WANDB_PROJECT}"
+   --wandb-group "${WANDB_GROUP}"
    --wandb-mode offline
-   # --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
 )
 
 MISC_ARGS=(
@@ -223,8 +238,6 @@ if [[ "${ROLE}" == "worker" ]]; then
   trap cleanup_worker EXIT
 
   echo "Starting blocking Ray worker against ${MASTER_ADDR}:6379 from ${LOCAL_NODE_IP}"
-  # Keep the containerized worker process attached to the Slurm task so the
-  # Ray node does not disappear as soon as the shell script exits.
   set +e
   "${RAY_BIN}" start \
     --address="${MASTER_ADDR}:6379" \
@@ -258,7 +271,7 @@ fi
 
 if [[ -n "${HOSTFILE}" ]]; then
   for WORKER_IP in $(awk '{print $1}' "${HOSTFILE}"); do
-    if [[ "$WORKER_IP" == "$MASTER_ADDR" || "$WORKER_IP" == "$LOCAL_NODE_IP" ]]; then
+    if [[ "${WORKER_IP}" == "${MASTER_ADDR}" || "${WORKER_IP}" == "${LOCAL_NODE_IP}" ]]; then
       continue
     fi
     echo "Starting Ray worker on ${WORKER_IP}"
@@ -296,6 +309,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "no_proxy": "localhost,127.0.0.1,0.0.0.0,${MASTER_ADDR}",
     "GLOO_SOCKET_IFNAME": "${SOCKET_IFNAME}",
     "TP_SOCKET_IFNAME": "${SOCKET_IFNAME}",
+    "NCCL_SOCKET_IFNAME": "${NCCL_SOCKET_IFNAME}",
     "MASTER_ADDR": "${MASTER_ADDR}",
     "PYTHONPATH": "/root/Megatron-LM/",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",

@@ -9,10 +9,15 @@
 - [x] Data/Model
   - [x] Dataset Prep
   - [x] Convert to slime Format
-- [ ] GRPO
+- [x] GRPO
   - [x] [1N4G](scripts/run-qwen3-4B.sh)
   - [x] [2N8G](scripts/run-qwen3-4B-2N8G.sh)
-  - [ ] [4N16G](scripts/run-qwen3-4B-4N16G.sh)
+  - [x] [4N16G](scripts/run-qwen3-4B-4N16G.sh)
+  - [x] [xN4xG generic](scripts/run-qwen3-4B-xN4xG.sh)
+- [ ] PD Rollout
+- [ ] Non-colocated
+
+
 
 ### 1. Run the container 
 ```bash
@@ -35,3 +40,16 @@ bash scripts/convert_hf_megatron.sh
 ```bash
 bash scripts/run-qwen3-4B.sh 2>&1 | tee run.log
 ```
+
+## Generic multi-node launcher
+
+Use the generic launcher when you want the same Qwen3-4B GRPO setup on `x`
+nodes with 4 GPUs per node:
+
+```bash
+ACTOR_NUM_NODES=2 MASTER_ADDR=<head_ip> LOCAL_NODE_IP=<head_ip> SOCKET_IFNAME=hsn0 ROLE=head \
+  bash scripts/run-qwen3-4B-xN4xG.sh
+```
+
+The worker nodes should run the same script with `ROLE=worker` and their own
+`LOCAL_NODE_IP`.
