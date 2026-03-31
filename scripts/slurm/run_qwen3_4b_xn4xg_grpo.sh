@@ -30,6 +30,49 @@ DATASETS_BIND="${DATASETS_BIND:-/work/nvme/bcrc/yzhao25/rl_datasets:/mnt/dataset
 LAUNCH_SCRIPT="/u/yzhao25/slime-tests/scripts/run-qwen3-4B-xN4xG.sh"
 NODELIST="${SLURM_JOB_NODELIST:-${SLURM_NODELIST:-}}"
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-}}}"
+NTFY_TOPIC="${NTFY_TOPIC:-ken_alerts}"
+NTFY_URL="${NTFY_URL:-https://ntfy.sh/${NTFY_TOPIC}}"
+
+notify_ntfy() {
+  local title="$1"
+  local message="$2"
+  local tags="${3:-bell}"
+  local priority="${4:-default}"
+
+  if [[ -z "${NTFY_URL}" ]]; then
+    return 0
+  fi
+
+  if ! curl -fsS \
+    -H "Title: ${title}" \
+    -H "Tags: ${tags}" \
+    -H "Priority: ${priority}" \
+    -d "${message}" \
+    "${NTFY_URL}" >/dev/null; then
+    echo "Warning: failed to send ntfy alert to ${NTFY_URL}" >&2
+  fi
+}
+
+notify_finish() {
+  local exit_code="$1"
+  local status="finished"
+  local tags="white_check_mark"
+  local priority="default"
+
+  if [[ "${exit_code}" -ne 0 ]]; then
+    status="failed"
+    tags="x"
+    priority="high"
+  fi
+
+  notify_ntfy \
+    "Qwen3-4B GRPO ${status}" \
+    "Job ${SLURM_JOB_ID:-N/A} ${status} on ${NODELIST:-unknown} (exit=${exit_code})" \
+    "${tags}" \
+    "${priority}"
+}
+
+trap 'notify_finish "$?"' EXIT
 
 if [[ -z "${NODELIST}" ]]; then
   cat >&2 <<'EOF'
@@ -64,6 +107,12 @@ echo "HEAD_NODE: ${HEAD_NODE}"
 echo "MASTER_ADDR(${SOCKET_IFNAME}): ${MASTER_ADDR}"
 echo "IMAGE: ${IMAGE}"
 echo "LAUNCH_SCRIPT: ${LAUNCH_SCRIPT}"
+
+notify_ntfy \
+  "Qwen3-4B GRPO launched" \
+  "Job ${SLURM_JOB_ID:-N/A} launched on ${NODELIST} with ${ACTOR_NUM_NODES} node(s); head=${HEAD_NODE}; master=${MASTER_ADDR}" \
+  "rocket" \
+  "high"
 
 # srun launches one task per node (ntasks-per-node=1).
 # Task 0 becomes the Ray head; the remaining task(s) join as workers.
